@@ -74,6 +74,7 @@ public class VisageHandler extends AbstractHandler {
 	public static final Pattern URL_WITH_SIZE_AND_MODE_PATTERN = Pattern.compile("^/([A-Za-z]*?)/([0-9]+)/([A-Za-z0-9_]*|X-Steve|X-Alex)(?:\\.png)?$");
 	
 	public static final Pattern USERNAME_PATTERN = Pattern.compile("^[A-Za-z0-9_]{1,16}$");
+	public static final Pattern MOJANG_TEXTURE_PATTERN = Pattern.compile("^mojang:([A-Fa-f0-9]{64})$");
 	public static final Pattern DASHLESS_UUID_PATTERN = Pattern.compile("^([A-Fa-f0-9]{8})([A-Fa-f0-9]{4})([A-Fa-f0-9]{4})([A-Fa-f0-9]{4})([A-Fa-f0-9]{12})$");
 	
 	private final VisageDistributor distributor;
@@ -211,15 +212,20 @@ public class VisageHandler extends AbstractHandler {
 			sendPermanentRedirect(baseUrl+"/"+modeStr+"/"+rounded+"/"+subject+query, response);
 			return;
 		}
-		
+
+		String mojangId = null;
 		UUID uuid = null;
 		if (subject.equals("X-Steve")) {
 			uuid = new UUID(0 | (8 << 12), 0);
 		} else if (subject.equals("X-Alex")) {
 			uuid = new UUID(0 | (8 << 12), 1);
 		} else {
+			Matcher mojangTexture = MOJANG_TEXTURE_PATTERN.matcher(subject);
 			Matcher dashless = DASHLESS_UUID_PATTERN.matcher(subject);
-			if (dashless.matches()) {
+			if(mojangTexture.matches()) {
+				mojangId = mojangTexture.group(1);
+				uuid = UUID.randomUUID();
+			} else if (dashless.matches()) {
 				uuid = UUID.fromString(dashless.replaceAll("$1-$2-$3-$4-$5"));
 			} else {
 				if (usernames) {
@@ -295,8 +301,14 @@ public class VisageHandler extends AbstractHandler {
 		GameProfile profile = new GameProfile(uuid, "<unknown>");
 		byte[] skin;
 		try (Jedis sj = distributor.getSkinJedis()) {
-			byte[] resp = sj.get((uuid.toString()+":profile").getBytes(Charsets.UTF_8));
-			byte[] skinResp = sj.get((uuid.toString()+":skin").getBytes(Charsets.UTF_8));
+			String id = null;
+
+			if(mojangId != null)
+				id = mojangId;
+			else id = uuid.toString();
+
+			byte[] resp = sj.get(redisProfile(id));
+			byte[] skinResp = sj.get(redisSkin(id));
 			if (resp != null) {
 				profile = ss.fillProfileTextures(Profiles.readGameProfile(new DataInputStream(new ByteArrayInputStream(resp))), false);
 			} else {
@@ -304,14 +316,20 @@ public class VisageHandler extends AbstractHandler {
 					profile = new GameProfile(uuid, subject.substring(2));
 				} else {
 					if (cacheHeader) missed.add("profile");
-					profile = ss.fillProfileProperties(profile);
-					profile = ss.fillProfileTextures(profile, false);
+
+					if(mojangId != null) {
+						fillProfileTextureById(profile, mojangId);
+					} else {
+						profile = ss.fillProfileProperties(profile);
+						profile = ss.fillProfileTextures(profile, false);
+					}
+
 					ByteArrayOutputStream baos = new ByteArrayOutputStream();
 					DataOutputStream dos = new DataOutputStream(baos);
 					Profiles.writeGameProfile(dos, profile);
 					dos.close();
-					sj.set((uuid.toString()+":profile").getBytes(Charsets.UTF_8), baos.toByteArray());
-					sj.pexpire(uuid.toString()+":profile", skinTtlMillis);
+					sj.set(redisProfile(id), baos.toByteArray());
+					sj.pexpire(redisProfile(id), skinTtlMillis);
 				}
 			}
 			if (skinResp != null && skinResp.length > 3) {
@@ -340,8 +358,8 @@ public class VisageHandler extends AbstractHandler {
 					ImageIO.write(ImageIO.read(new ByteArrayInputStream(skin)), "PNG", baos);
 					skin = baos.toByteArray();
 				}
-				sj.set((uuid.toString()+":skin").getBytes(Charsets.UTF_8), skin);
-				sj.pexpire(uuid.toString()+":skin", skinTtlMillis);
+				sj.set(redisSkin(id), skin);
+				sj.pexpire(redisSkin(id), skinTtlMillis);
 			}
 		} catch (Exception e) {
 			Visage.log.log(Level.WARNING, "An error occurred while resolving texture data", e);
@@ -454,5 +472,24 @@ public class VisageHandler extends AbstractHandler {
 		response.getOutputStream().flush();
 		response.setStatus(200);
 		response.flushBuffer();
+	}
+
+	// id should be UUID or Mojang Texture ID
+	private byte[] redisProfile(String id) {
+		return (id+":profile").getBytes(Charsets.UTF_8);
+	}
+
+	// id should be UUID or Mojang Texture ID
+	private byte[] redisSkin(String id) {
+		return (id+":skin").getBytes(Charsets.UTF_8);
+	}
+
+	private final String mojangTextureUrl = "http://textures.minecraft.net/texture/";
+	private GameProfile fillProfileTextureById(GameProfile profile, String textureId) {
+		profile.getTextures().put(
+				TextureType.SKIN,
+				new GameProfile.Texture(mojangTextureUrl + textureId, null)
+		);
+		return profile;
 	}
 }
